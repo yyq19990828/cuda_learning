@@ -27,7 +27,18 @@ void cpuSgemm(
     }
 }
 
-
+/**
+ * @brief 计算矩阵乘法 C = A * B
+ * @param a 输入矩阵A [M x K]
+ * @param b 输入矩阵B [K x N]
+ * @param c 输出矩阵C [M x N]
+ * @param M 矩阵A的行数
+ * @param N 矩阵B的列数
+ * @param K 矩阵A的列数和矩阵B的行数
+ * @note 该函数使用了共享内存来加速矩阵乘法的计算
+ * @note 该函数使用了转置存储来避免bank conflict
+ * @note 该函数使用了4个float组成的向量来存储A和B矩阵的元素
+ */
 __global__ void sgemm_V2(
     float * __restrict__ a, float * __restrict__ b, float * __restrict__ c,
     const int M, const int N, const int K) {
@@ -38,45 +49,47 @@ __global__ void sgemm_V2(
     const int TM = 8;
     const int TN = 8;
 
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int tid = ty * blockDim.x + tx;
+    const int bx = blockIdx.x;              // 线程块的x坐标
+    const int by = blockIdx.y;              // 线程块的y坐标
+    const int tx = threadIdx.x;              // 线程的x坐标
+    const int ty = threadIdx.y;              // 线程的y坐标
+    const int tid = ty * blockDim.x + tx;   // 线程在块中的唯一标识符
 
-    __shared__ float s_a[BK][BM];
+    //* 共享内存存储A和B矩阵的分块
+    __shared__ float s_a[BK][BM];   // 转置存储为了避免bank conflict
     __shared__ float s_b[BK][BN];
 
-    float r_load_a[4];
-    float r_load_b[4];
+    float r_load_a[4];          // 4个float组成的向量, 用于存储A矩阵的4个元素
+    float r_load_b[4];          // 4个float组成的向量, 用于存储B矩阵的4个元素
     float r_comp_a[TM];
     float r_comp_b[TN];
     float r_c[TM][TN] = {0.0};
 
-    int load_a_smem_m = tid >> 1;
-    int load_a_smem_k = (tid & 1) << 2;
-    int load_b_smem_k = tid >> 5;
-    int load_b_smem_n = (tid & 31) << 2;
+    int load_a_smem_m = tid >> 1;            // 线程在矩阵A共享内存中的行坐标(注意由于转置存储, 这里的行坐标实际上是列坐标)
+    int load_a_smem_k = (tid & 1) << 2;      // 线程在矩阵A共享内存中的列坐标(注意由于转置存储, 这里的列坐标实际上是行坐标)
+    int load_b_smem_k = tid >> 5;            // 线程在矩阵B共享内存中的行坐标
+    int load_b_smem_n = (tid & 31) << 2;     // 线程在矩阵B共享内存中的列坐标
 
-    int load_a_gmem_m = by * BM + load_a_smem_m;
-    int load_b_gmem_n = bx * BN + load_b_smem_n;
+    int load_a_gmem_m = by * BM + load_a_smem_m;    // 线程在矩阵A全局内存中的行坐标
+    int load_b_gmem_n = bx * BN + load_b_smem_n;    // 线程在矩阵B全局内存中的列坐标
 
     for (int bk = 0; bk < (K + BK - 1) / BK; bk++) {
 
-        int load_a_gmem_k = bk * BK + load_a_smem_k;
-        int load_a_gmem_addr = OFFSET(load_a_gmem_m, load_a_gmem_k, K);
-        int load_b_gmem_k = bk * BK + load_b_smem_k;
-        int load_b_gmem_addr = OFFSET(load_b_gmem_k, load_b_gmem_n, N);
-        FLOAT4(r_load_a[0]) = FLOAT4(a[load_a_gmem_addr]);
-        FLOAT4(r_load_b[0]) = FLOAT4(b[load_b_gmem_addr]);
+        int load_a_gmem_k = bk * BK + load_a_smem_k;                    // 线程在矩阵A全局内存中的列坐标
+        int load_a_gmem_addr = OFFSET(load_a_gmem_m, load_a_gmem_k, K); // 线程在矩阵A全局内存中的地址
+        int load_b_gmem_k = bk * BK + load_b_smem_k;                    // 线程在矩阵B全局内存中的行坐标
+        int load_b_gmem_addr = OFFSET(load_b_gmem_k, load_b_gmem_n, N); // 线程在矩阵B全局内存中的地址
+        FLOAT4(r_load_a[0]) = FLOAT4(a[load_a_gmem_addr]);  // 读取A矩阵的4个元素
+        FLOAT4(r_load_b[0]) = FLOAT4(b[load_b_gmem_addr]);  // 读取B矩阵的4个元素
 
+        //* 每个线程负责加载4个float组成的向量
         s_a[load_a_smem_k    ][load_a_smem_m] = r_load_a[0];
         s_a[load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
         s_a[load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
         s_a[load_a_smem_k + 3][load_a_smem_m] = r_load_a[3];
         FLOAT4(s_b[load_b_smem_k][load_b_smem_n]) = FLOAT4(r_load_b[0]);
 
-        __syncthreads();
+        __syncthreads(); // 同步线程, 保证sa和sb中的数据已经准备好
 
         #pragma unroll
         for (int tk = 0; tk < BK; tk++) {
